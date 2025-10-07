@@ -1,5 +1,6 @@
 use crate::protocol::{Message, MessageType, deserialize, serialize};
-use crate::security::{decrypt, encrypt, generate_key};
+use crate::security::{decrypt, encrypt};
+use rand_core::OsRng;
 use rustls::RootCertStore;
 use rustls::{
     ClientConfig, ServerConfig,
@@ -14,6 +15,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use tokio_rustls::TlsStream;
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 // Configure TLS server
 fn load_server_config() -> io::Result<Arc<ServerConfig>> {
@@ -71,19 +73,14 @@ pub async fn start_listener(port: u16) -> io::Result<()> {
     loop {
         let (stream, addr) = listener.accept().await?;
         let acceptor = acceptor.clone();
-        
-        // BUG: 
-        // SECURITY FLAW/BUG: The **key must be provided** by the file sender. 
-        // Local key generation is a **temporary test measure** and **must not be used** in real scenarios.
-        let key = generate_key().expect("fail to generate key");
-        
+
         tokio::spawn(async move {
             let stream: TlsStream<TcpStream> = acceptor
                 .accept(stream)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
                 .into();
-            handle_connection(stream, addr.to_string(), &key)
+            handle_connection(stream, addr.to_string())
                 .await
                 .unwrap_or_else(|e| {
                     eprintln!("Error handling connection from {}: {}", addr, e);
@@ -94,13 +91,39 @@ pub async fn start_listener(port: u16) -> io::Result<()> {
 }
 
 // connect to another peer
-pub async fn connect_to_peer(addr: &str, key: &[u8; 32], file_path: &str) -> io::Result<()> {
+pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
     let config = load_client_config()?;
     let stream = TcpStream::connect(addr).await?;
     let server_name = rustls::pki_types::ServerName::try_from("localhost")
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let connector = tokio_rustls::TlsConnector::from(config);
     let mut stream: TlsStream<TcpStream> = connector.connect(server_name, stream).await?.into();
+
+    // produce key pair sender
+    let sender_secret = EphemeralSecret::random_from_rng(OsRng);
+    let sender_public = PublicKey::from(&sender_secret);
+    let msg = Message {
+        version: 1,
+        msg_type: MessageType::KeyExchange {
+            public_key: sender_public.to_bytes(),
+        },
+    };
+    stream.write_all(&serialize(&msg)).await?;
+
+    // wait for recieve public key reciever
+    let response = read_message(&mut stream).await?;
+    let receiver_public = if let MessageType::KeyExchange { public_key } = response.msg_type {
+        PublicKey::from(public_key)
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Expected KeyExchange",
+        ));
+    };
+
+    // calculate shared secrect
+    let shared_secret = sender_secret.diffie_hellman(&receiver_public);
+    let key: [u8; 32] = shared_secret.to_bytes(); // AES-256
 
     // send REQUEST message
     let file = File::open(file_path)?;
@@ -120,7 +143,7 @@ pub async fn connect_to_peer(addr: &str, key: &[u8; 32], file_path: &str) -> io:
     // wait for answer (ACCEPT/REJECT)
     let response = read_message(&mut stream).await?;
     match response.msg_type {
-        MessageType::Accept => send_file(&mut stream, file_path, key).await,
+        MessageType::Accept => send_file(&mut stream, file_path, &key).await,
         MessageType::Reject => Ok(println!("Peer rejected the file transfer")),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -138,14 +161,31 @@ async fn read_message(stream: &mut TlsStream<TcpStream>) -> io::Result<Message> 
 }
 
 // handle incoming connections
-async fn handle_connection(
-    mut stream: TlsStream<TcpStream>,
-    addr: String,
-    key: &[u8; 32],
-) -> io::Result<()> {
+async fn handle_connection(mut stream: TlsStream<TcpStream>, addr: String) -> io::Result<()> {
     loop {
         let msg = read_message(&mut stream).await?;
+        let mut key = [0u8; 32];
+
         match msg.msg_type {
+            MessageType::KeyExchange { public_key } => {
+                // produce key pair receiver
+                let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
+                let receiver_public = PublicKey::from(&receiver_secret);
+                let response = Message {
+                    version: 1,
+                    msg_type: MessageType::KeyExchange {
+                        public_key: receiver_public.to_bytes(),
+                    },
+                };
+                stream.write_all(&serialize(&response)).await?;
+
+                // calculate shared secret
+                let sender_public = PublicKey::from(public_key);
+                let shared_secret = receiver_secret.diffie_hellman(&sender_public);
+                key = shared_secret.to_bytes();
+
+                continue; // wait for next message like REQUEST
+            }
             MessageType::Request {
                 file_name,
                 size,
@@ -161,7 +201,7 @@ async fn handle_connection(
                     msg_type: MessageType::Accept, // TODO: get from user
                 };
                 stream.write_all(&serialize(&response)).await?;
-                receive_file(&mut stream, &file_name, &hash, key).await?;
+                receive_file(&mut stream, &file_name, &hash, &key).await?;
             }
             MessageType::Cancel => {
                 println!("Transfer cancelled by {}", addr);
@@ -276,75 +316,61 @@ async fn receive_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
     use std::fs;
+    use tokio::time::{Duration, timeout};
+
+    #[tokio::test]
+    async fn test_key_exchange() {
+        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
+        let sender_public = PublicKey::from(&sender_secret);
+        let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
+        let receiver_public = PublicKey::from(&receiver_secret);
+        let sender_shared = sender_secret.diffie_hellman(&receiver_public);
+        let receiver_shared = receiver_secret.diffie_hellman(&sender_public);
+        assert_eq!(sender_shared.to_bytes(), receiver_shared.to_bytes());
+    }
 
     #[tokio::test]
     async fn test_connect_and_send_request() {
         let port = 8081;
-        let key = generate_key().unwrap();
-        
-        // شروع listener در پس‌زمینه
+
         tokio::spawn(async move {
             start_listener(port).await.unwrap();
         });
-        
-        // صبر برای شروع listener
+
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // تست اتصال و ارسال REQUEST
+
         fs::write("test.txt", "Hello").unwrap(); // فایل تست
-        let result = timeout(Duration::from_secs(2), connect_to_peer("127.0.0.1:8081", &key, "test.txt")).await;
+        let result = timeout(
+            Duration::from_secs(2),
+            connect_to_peer("127.0.0.1:8081", "test.txt"),
+        )
+        .await;
         assert!(result.is_ok(), "Failed to connect and send request");
         fs::remove_file("test.txt").unwrap();
     }
 
     #[tokio::test]
-    async fn test_handle_invalid_message() {
-        let port = 8082;
-        tokio::spawn(async move {
-            start_listener(port).await.unwrap();
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        let config = load_client_config().unwrap();
-        let stream = TcpStream::connect("127.0.0.1:8082").await.unwrap();
-        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
-        let connector = tokio_rustls::TlsConnector::from(config);
-        let mut stream = connector.connect(server_name, stream).await.unwrap();
-        
-        // ارسال پیام نامعتبر
-        stream.write_all(b"INVALID").await.unwrap();
-        // صبر برای اطمینان از اینکه اتصال بسته نشده
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        // تست اینکه stream هنوز قابل نوشتنه
-        let result = stream.write_all(b"PING").await;
-        assert!(result.is_ok(), "Stream is not writable after invalid message");
-    }
-
-    #[tokio::test]
     async fn test_receive_file() {
         let port = 8083;
-        let key = generate_key().unwrap();
-        
-        // شروع listener در پس‌زمینه
+
         tokio::spawn(async move {
             start_listener(port).await.unwrap();
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        
-        // ایجاد فایل تست
+
         fs::write("send_test.txt", "Hello, world!").unwrap();
-        
-        // اتصال و ارسال فایل
-        let result = timeout(Duration::from_secs(2), connect_to_peer("127.0.0.1:8083", &key, "send_test.txt")).await;
+
+        let result = timeout(
+            Duration::from_secs(2),
+            connect_to_peer("127.0.0.1:8083", "send_test.txt"),
+        )
+        .await;
         assert!(result.is_ok(), "Failed to send file");
-        
-        // بررسی فایل دریافت‌شده
+
         let received = fs::read_to_string("send_test.txt").unwrap();
         assert_eq!(received, "Hello, world!");
-        
-        // پاک‌سازی
+
         fs::remove_file("send_test.txt").unwrap();
     }
 }

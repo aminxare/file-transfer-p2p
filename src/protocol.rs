@@ -10,6 +10,9 @@ pub enum MessageType {
     Accept,
     Reject,
     Cancel,
+    KeyExchange {
+        public_key: [u8; 32],
+    },
     Chunk {
         offset: u64,
         data: Vec<u8>,
@@ -56,6 +59,19 @@ pub fn deserialize(data: &[u8]) -> Option<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_key_exchange_serialize() {
+        let msg = Message {
+            version: 1,
+            msg_type: MessageType::KeyExchange {
+                public_key: [0u8; 32],
+            },
+        };
+        let bytes = serialize(&msg);
+        let deserialized = deserialize(&bytes).unwrap();
+        assert_eq!(msg, deserialized);
+    }
 
     #[test]
     fn test_serialize_deserialize() {

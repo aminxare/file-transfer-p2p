@@ -10,11 +10,11 @@ use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
 };
-use tokio_rustls::TlsStream;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 // Configure TLS server
@@ -75,7 +75,7 @@ pub async fn start_listener(port: u16) -> io::Result<()> {
         let acceptor = acceptor.clone();
 
         tokio::spawn(async move {
-            let stream: TlsStream<TcpStream> = acceptor
+            let stream = acceptor
                 .accept(stream)
                 .await
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
@@ -97,7 +97,7 @@ pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
     let server_name = rustls::pki_types::ServerName::try_from("localhost")
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let connector = tokio_rustls::TlsConnector::from(config);
-    let mut stream: TlsStream<TcpStream> = connector.connect(server_name, stream).await?.into();
+    let mut stream = connector.connect(server_name, stream).await?;
 
     // produce key pair sender
     let sender_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -153,7 +153,10 @@ pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
 }
 
 // read message from stream
-async fn read_message(stream: &mut TlsStream<TcpStream>) -> io::Result<Message> {
+async fn read_message<S>(stream: &mut S) -> io::Result<Message>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut buffer = vec![0u8; 1024];
     let n = stream.read(&mut buffer).await?;
     deserialize(&buffer[..n])
@@ -161,7 +164,10 @@ async fn read_message(stream: &mut TlsStream<TcpStream>) -> io::Result<Message> 
 }
 
 // handle incoming connections
-async fn handle_connection(mut stream: TlsStream<TcpStream>, addr: String) -> io::Result<()> {
+async fn handle_connection(
+    mut stream: tokio_rustls::server::TlsStream<TcpStream>,
+    addr: String,
+) -> io::Result<()> {
     loop {
         let msg = read_message(&mut stream).await?;
         let mut key = [0u8; 32];
@@ -200,7 +206,9 @@ async fn handle_connection(mut stream: TlsStream<TcpStream>, addr: String) -> io
                     version: 1,
                     msg_type: MessageType::Accept, // TODO: get from user
                 };
+                // sending REQUEST result
                 stream.write_all(&serialize(&response)).await?;
+                // receive file if REQUEST accepted!
                 receive_file(&mut stream, &file_name, &hash, &key).await?;
             }
             MessageType::Cancel => {
@@ -214,11 +222,10 @@ async fn handle_connection(mut stream: TlsStream<TcpStream>, addr: String) -> io
 }
 
 // send file
-async fn send_file(
-    stream: &mut TlsStream<TcpStream>,
-    file_path: &str,
-    key: &[u8; 32],
-) -> io::Result<()> {
+async fn send_file<S>(stream: &mut S, file_path: &str, key: &[u8; 32]) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut file = File::open(file_path)?;
     let mut buffer = vec![0u8; 4096]; // chunkهای 4KB
     let mut offset = 0;
@@ -271,12 +278,12 @@ async fn send_file(
 
 // recieve file
 async fn receive_file(
-    stream: &mut TlsStream<TcpStream>,
+    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
     file_name: &str,
     _expected_hash: &str,
     key: &[u8; 32],
 ) -> io::Result<()> {
-    let mut file = File::create(file_name)?;
+    let mut file = File::create(format!("recieve_{}", file_name))?;
     loop {
         let msg = read_message(stream).await?;
         match msg.msg_type {
@@ -330,6 +337,8 @@ mod tests {
         assert_eq!(sender_shared.to_bytes(), receiver_shared.to_bytes());
     }
 
+
+    // TODO: use tmp file 
     #[tokio::test]
     async fn test_connect_and_send_request() {
         let port = 8081;

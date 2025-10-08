@@ -7,14 +7,6 @@ use rand::{TryRngCore, rngs::OsRng};
 type Error = Box<dyn std::error::Error>;
 type Result<T> = core::result::Result<T, Error>;
 
-pub fn generate_key() -> Result<[u8; 32]> {
-    let mut key = [0u8; 32];
-    OsRng
-        .try_fill_bytes(&mut key)
-        .map_err(|e| format!("error while filling bytes: cause -> {e}"))?;
-    Ok(key)
-}
-
 pub fn encrypt(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new(key.into());
     let mut nonce = [0u8; 12];
@@ -45,6 +37,14 @@ pub fn decrypt(encrypted: &[u8], key: &[u8; 32]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn generate_key() -> Result<[u8; 32]> {
+        let mut key = [0u8; 32];
+        OsRng
+            .try_fill_bytes(&mut key)
+            .map_err(|e| format!("error while filling bytes: cause -> {e}"))?;
+        Ok(key)
+    }
 
     #[test]
     fn test_encrypt_decrypt() {

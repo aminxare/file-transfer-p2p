@@ -66,20 +66,20 @@ fn load_client_config() -> io::Result<Arc<ClientConfig>> {
 
 // start listening to get data
 pub async fn start_listener(port: u16) -> io::Result<()> {
-    let config = load_server_config()?;
+    // let config = load_server_config()?;
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    // let acceptor = tokio_rustls::TlsAcceptor::from(config);
 
     loop {
         let (stream, addr) = listener.accept().await?;
-        let acceptor = acceptor.clone();
+        // let acceptor = acceptor.clone();
 
         tokio::spawn(async move {
-            let stream = acceptor
-                .accept(stream)
-                .await
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-                .into();
+            // let stream = acceptor
+            //     .accept(stream)
+            //     .await
+            //     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            //     .into();
             handle_connection(stream, addr.to_string())
                 .await
                 .unwrap_or_else(|e| {
@@ -92,12 +92,12 @@ pub async fn start_listener(port: u16) -> io::Result<()> {
 
 // connect to another peer
 pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
-    let config = load_client_config()?;
-    let stream = TcpStream::connect(addr).await?;
-    let server_name = rustls::pki_types::ServerName::try_from("localhost")
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let connector = tokio_rustls::TlsConnector::from(config);
-    let mut stream = connector.connect(server_name, stream).await?;
+    // let config = load_client_config()?;
+    let mut stream = TcpStream::connect(addr).await?;
+    // let server_name = rustls::pki_types::ServerName::try_from("localhost")
+    //     .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // let connector = tokio_rustls::TlsConnector::from(config);
+    // let mut stream = connector.connect(server_name, stream).await?;
 
     // produce key pair sender
     let sender_secret = EphemeralSecret::random_from_rng(OsRng);
@@ -165,15 +165,18 @@ where
 
 // handle incoming connections
 async fn handle_connection(
-    mut stream: tokio_rustls::server::TlsStream<TcpStream>,
+    // mut stream: tokio_rustls::server::TlsStream<TcpStream>,
+    mut stream: TcpStream,
     addr: String,
 ) -> io::Result<()> {
+    let mut key = [0u8; 32];
     loop {
         let msg = read_message(&mut stream).await?;
-        let mut key = [0u8; 32];
 
         match msg.msg_type {
             MessageType::KeyExchange { public_key } => {
+                // clear previous key
+                key.fill(0);
                 // produce key pair receiver
                 let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
                 let receiver_public = PublicKey::from(&receiver_secret);
@@ -188,7 +191,7 @@ async fn handle_connection(
                 // calculate shared secret
                 let sender_public = PublicKey::from(public_key);
                 let shared_secret = receiver_secret.diffie_hellman(&sender_public);
-                key = shared_secret.to_bytes();
+                key.copy_from_slice(shared_secret.to_bytes().as_slice());
 
                 continue; // wait for next message like REQUEST
             }
@@ -278,7 +281,8 @@ where
 
 // recieve file
 async fn receive_file(
-    stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    // stream: &mut tokio_rustls::server::TlsStream<TcpStream>,
+    stream: &mut TcpStream,
     file_name: &str,
     _expected_hash: &str,
     key: &[u8; 32],
@@ -288,6 +292,7 @@ async fn receive_file(
         let msg = read_message(stream).await?;
         match msg.msg_type {
             MessageType::Chunk { offset, data } => {
+                println!("key: {:?}", key);
                 let decrypted = decrypt(&data, &key).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "Decryption failed")
                 })?;
@@ -337,8 +342,7 @@ mod tests {
         assert_eq!(sender_shared.to_bytes(), receiver_shared.to_bytes());
     }
 
-
-    // TODO: use tmp file 
+    // TODO: use tmp file
     #[tokio::test]
     async fn test_connect_and_send_request() {
         let port = 8081;

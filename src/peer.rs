@@ -1,5 +1,6 @@
 use crate::protocol::{Message, MessageType, deserialize, serialize};
 use crate::security::{decrypt, encrypt};
+use log::{debug, error, info, warn};
 use rand_core::OsRng;
 use rustls::RootCertStore;
 use rustls::{
@@ -16,6 +17,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
 };
 use x25519_dalek::{EphemeralSecret, PublicKey};
+
+use chrono::Local;
 
 // Configure TLS server
 fn load_server_config() -> io::Result<Arc<ServerConfig>> {
@@ -83,7 +86,7 @@ pub async fn start_listener(port: u16) -> io::Result<()> {
             handle_connection(stream, addr.to_string())
                 .await
                 .unwrap_or_else(|e| {
-                    eprintln!("Error handling connection from {}: {}", addr, e);
+                    error!("Error handling connection from {}: {}", addr, e);
                 });
             Ok::<_, io::Error>(())
         });
@@ -100,6 +103,7 @@ pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
     // let mut stream = connector.connect(server_name, stream).await?;
 
     // produce key pair sender
+    info!("client started handshaking...");
     let sender_secret = EphemeralSecret::random_from_rng(OsRng);
     let sender_public = PublicKey::from(&sender_secret);
     let msg = Message {
@@ -124,6 +128,7 @@ pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
     // calculate shared secrect
     let shared_secret = sender_secret.diffie_hellman(&receiver_public);
     let key: [u8; 32] = shared_secret.to_bytes(); // AES-256
+    info!("client end handshaking...");
 
     // send REQUEST message
     let file = File::open(file_path)?;
@@ -137,14 +142,16 @@ pub async fn connect_to_peer(addr: &str, file_path: &str) -> io::Result<()> {
             hash,
         },
     };
+    info!("client started sending REQUEST.");
     let data = serialize(&msg);
     stream.write_all(&data).await?;
 
     // wait for answer (ACCEPT/REJECT)
     let response = read_message(&mut stream).await?;
+    info!("client end sending REQUEST.");
     match response.msg_type {
         MessageType::Accept => send_file(&mut stream, file_path, &key).await,
-        MessageType::Reject => Ok(println!("Peer rejected the file transfer")),
+        MessageType::Reject => Ok(error!("Peer rejected the file transfer")),
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "Unexpected response",
@@ -157,7 +164,7 @@ async fn read_message<S>(stream: &mut S) -> io::Result<Message>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0u8; 1024];
+    let mut buffer = vec![0u8; 4096];
     let n = stream.read(&mut buffer).await?;
     deserialize(&buffer[..n])
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Failed to deserialize message"))
@@ -175,6 +182,7 @@ async fn handle_connection(
 
         match msg.msg_type {
             MessageType::KeyExchange { public_key } => {
+                info!("server start handshaking.");
                 // clear previous key
                 key.fill(0);
                 // produce key pair receiver
@@ -192,6 +200,7 @@ async fn handle_connection(
                 let sender_public = PublicKey::from(public_key);
                 let shared_secret = receiver_secret.diffie_hellman(&sender_public);
                 key.copy_from_slice(shared_secret.to_bytes().as_slice());
+                info!("server end handshaking");
 
                 continue; // wait for next message like REQUEST
             }
@@ -201,7 +210,7 @@ async fn handle_connection(
                 hash,
             } => {
                 // TODO: ask user for accept from CLI
-                println!(
+                info!(
                     "Received file request from {}: {} ({} bytes)",
                     addr, file_name, size
                 );
@@ -212,17 +221,82 @@ async fn handle_connection(
                 // sending REQUEST result
                 stream.write_all(&serialize(&response)).await?;
                 // receive file if REQUEST accepted!
-                receive_file(&mut stream, &file_name, &hash, &key).await?;
+                return receive_file(&mut stream, &file_name, &hash, &key).await;
             }
             MessageType::Cancel => {
-                println!("Transfer cancelled by {}", addr);
+                info!("Transfer cancelled by {}", addr);
                 break;
             }
-            _ => println!("Unhandled message type from {}", addr),
+            _ => warn!("Unhandled message type from {}", addr),
         }
     }
     Ok(())
 }
+
+//#region sendfile
+
+// // send file
+// async fn send_file<S>(stream: &mut S, file_path: &str, key: &[u8; 32]) -> io::Result<()>
+// where
+//     S: AsyncRead + AsyncWrite + Unpin,
+// {
+//     let mut file = File::open(file_path)?;
+//     let mut buffer = vec![0u8; 4096]; // chunk 4kb
+//     let mut offset = 0;
+
+//     loop {
+//         let n = file.read(&mut buffer)?;
+//         if n == 0 {
+//             // end of file
+//             let msg = Message {
+//                 version: 1,
+//                 msg_type: MessageType::Complete,
+//             };
+//             stream.write_all(&serialize(&msg)).await?;
+//             info!("file has been sent!");
+//             break;
+//         }
+//         let chunk = &buffer[..n];
+//         let encrypted = encrypt(chunk, key).map_err(|e| {
+//             io::Error::new(io::ErrorKind::Other, format!("Failed to encrypt data: {e}"))
+//         })?;
+//         info!("chunk len: {}", chunk.len());
+//         info!("encrypted len: {}", encrypted.len());
+//         let msg = Message {
+//             version: 1,
+//             msg_type: MessageType::Chunk {
+//                 offset,
+//                 data: encrypted,
+//             },
+//         };
+
+//         stream.write_all(&serialize(&msg)).await?;
+//         offset += n as u64;
+
+//         // waiting for receive ACK message
+//         let response = read_message(stream).await?;
+//         if let MessageType::Ack { offset: ack_offset } = response.msg_type {
+//             if ack_offset != offset {
+//                 info!("Invalid ack");
+//                 return Err(io::Error::new(
+//                     io::ErrorKind::InvalidData,
+//                     "Invalid ACK offset",
+//                 ));
+//             }
+//         } else if let MessageType::Cancel = response.msg_type {
+//             info!("Transfer cancelled by peer");
+//             return Ok(());
+//         } else {
+//             return Err(io::Error::new(
+//                 io::ErrorKind::InvalidData,
+//                 "Unexpected response",
+//             ));
+//         }
+//     }
+//     Ok(())
+// }
+
+//#endregion 
 
 // send file
 async fn send_file<S>(stream: &mut S, file_path: &str, key: &[u8; 32]) -> io::Result<()>
@@ -230,52 +304,98 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut file = File::open(file_path)?;
-    let mut buffer = vec![0u8; 4096]; // chunkهای 4KB
-    let mut offset = 0;
+    let mut buffer = vec![0u8; 4096]; // raw chunk buffer
+    let mut offset = 0u64;
+
+    const MAX_ENCRYPTED_SIZE: usize = 3900;
+    const MAX_SERIALIZED_SIZE: usize = 4096;
 
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
-            // end of file
+            // End of file
             let msg = Message {
                 version: 1,
                 msg_type: MessageType::Complete,
             };
-            stream.write_all(&serialize(&msg)).await?;
+            let serialized = serialize(&msg);
+            if serialized.len() > MAX_SERIALIZED_SIZE {
+                return Err(io::Error::new(io::ErrorKind::Other, "Complete message too large"));
+            }
+            stream.write_all(&serialized).await?;
+            info!("file has been sent!");
             break;
         }
-        let chunk = &buffer[..n];
+
+        let mut chunk = &buffer[..n];
+        let mut local_offset = offset;
+
+        // Encrypt and split into sub-chunks if needed
         let encrypted = encrypt(chunk, key).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Failed to encrypt data: {e}"))
         })?;
-        let msg = Message {
-            version: 1,
-            msg_type: MessageType::Chunk {
-                offset,
-                data: encrypted,
-            },
-        };
-        stream.write_all(&serialize(&msg)).await?;
-        offset += n as u64;
 
-        // waiting for receive ACK message
-        let response = read_message(stream).await?;
-        if let MessageType::Ack { offset: ack_offset } = response.msg_type {
-            if ack_offset != offset {
+        // Split encrypted data into sub-chunks so serialized message <= 4KB
+        for subchunk in encrypted.chunks(MAX_ENCRYPTED_SIZE) {
+            let msg = Message {
+                version: 1,
+                msg_type: MessageType::Chunk {
+                    offset: local_offset,
+                    data: subchunk.to_vec(),
+                },
+            };
+
+            let serialized = serialize(&msg);
+
+            if serialized.len() > MAX_SERIALIZED_SIZE {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid ACK offset",
+                    io::ErrorKind::Other,
+                    format!(
+                        "Serialized message too large: {} bytes (max 4096)",
+                        serialized.len()
+                    ),
                 ));
             }
-        } else if let MessageType::Cancel = response.msg_type {
-            return Ok(println!("Transfer cancelled by peer"));
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unexpected response",
-            ));
+
+            info!(
+                "Sending subchunk: offset={}, raw={}, encrypted={}, serialized={}",
+                local_offset,
+                n,
+                subchunk.len(),
+                serialized.len()
+            );
+
+            stream.write_all(&serialized).await?;
+
+            // Wait for ACK
+            let response = read_message(stream).await?;
+            match response.msg_type {
+                MessageType::Ack { offset: ack_offset } => {
+                    if ack_offset != local_offset + subchunk.len() as u64 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Invalid ACK offset",
+                        ));
+                    }
+                }
+                MessageType::Cancel => {
+                    info!("Transfer cancelled by peer");
+                    return Ok(());
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unexpected response",
+                    ));
+                }
+            }
+
+            local_offset += subchunk.len() as u64;
         }
+
+        offset += n as u64;
     }
+
     Ok(())
 }
 
@@ -290,9 +410,9 @@ async fn receive_file(
     let mut file = File::create(format!("recieve_{}", file_name))?;
     loop {
         let msg = read_message(stream).await?;
+        info!("|||||||||||||||||||||||||||||||||||||||||||");
         match msg.msg_type {
             MessageType::Chunk { offset, data } => {
-                println!("key: {:?}", key);
                 let decrypted = decrypt(&data, &key).ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidData, "Decryption failed")
                 })?;
@@ -307,11 +427,11 @@ async fn receive_file(
             }
             MessageType::Complete => {
                 // TODO: check file hash
-                println!("File received: {}", file_name);
+                info!("File received: {}", file_name);
                 break;
             }
             MessageType::Cancel => {
-                println!("Transfer cancelled by sender");
+                info!("Transfer cancelled by sender");
                 break;
             }
             _ => {

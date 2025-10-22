@@ -1,3 +1,4 @@
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
@@ -34,8 +35,10 @@ pub struct Message {
 
 pub fn serialize(msg: &Message) -> Vec<u8> {
     let json = serde_json::to_string(msg).unwrap();
+    println!("json: {}", json);
     let mut bytes = json.into_bytes();
     let len = bytes.len() as u32;
+    info!("serialize len: {}", len);
     let mut header = b"MAGIC".to_vec(); // 5 bytes magic
     header.extend_from_slice(&len.to_be_bytes()); // 4 bytes length
     header.append(&mut bytes);
@@ -47,9 +50,14 @@ pub fn deserialize(data: &[u8]) -> Option<Message> {
         return None;
     }
     let len = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
-
+    info!("deserialize len: {}", len);
+    info!("deserialize data.len: {}", data.len());
     // check if some data lost
     if data.len() != 9 + len {
+        info!("_________________________");
+        info!("real message len: {}", len);
+        info!("serialized data len: {}", data.len());
+        info!("_________________________");
         return None;
     }
     let json = std::str::from_utf8(&data[9..]).ok()?;

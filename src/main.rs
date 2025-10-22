@@ -1,4 +1,5 @@
 use clap::Parser;
+use log::{error, info};
 use tokio::{fs::File, io, spawn};
 
 use crate::peer::{connect_to_peer, start_listener};
@@ -32,19 +33,22 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    // initilize loggig
+    simple_logger::init().unwrap();
+
     let args = Args::parse();
 
     // start listener
     let handler = spawn(async move {
-        println!("--- start listening on port: {}", args.port);
+        info!("server started lintening on port: {}", args.port);
         start_listener(args.port)
             .await
-            .map_err(|e| eprintln!("Fail to start lintening. cause: {e}"))
+            .map_err(|e| error!("Fail to start lintening. cause: {e}"))
             .unwrap();
     });
 
     if let (Some(p), Some(to)) = (args.send, args.to) {
-        println!("Sending file: {}", p);
+        info!("Sending file: {}", p);
         send_file(p.as_str(), to.as_str()).await?;
     }
 

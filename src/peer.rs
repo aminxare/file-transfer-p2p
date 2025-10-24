@@ -18,8 +18,6 @@ use tokio::{
 };
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use chrono::Local;
-
 // Configure TLS server
 fn load_server_config() -> io::Result<Arc<ServerConfig>> {
     let cert_file = &mut BufReader::new(File::open("cert.pem")?);
@@ -164,9 +162,21 @@ async fn read_message<S>(stream: &mut S) -> io::Result<Message>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut buffer = vec![0u8; 4096];
-    let n = stream.read(&mut buffer).await?;
-    deserialize(&buffer[..n])
+    let mut buf: Vec<u8> = Vec::new();
+    let size = 4096;
+    loop {
+        let mut buffer = vec![0u8; size];
+        let n = stream.read(&mut buffer).await?;
+        println!("{n}");
+        // EOF
+        if n == 0 || n < size {
+            buf.append(&mut buffer);
+            break;
+        }
+        buf.append(&mut buffer);
+    }
+    
+    deserialize(&buf)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Failed to deserialize message"))
 }
 
@@ -233,70 +243,6 @@ async fn handle_connection(
     Ok(())
 }
 
-//#region sendfile
-
-// // send file
-// async fn send_file<S>(stream: &mut S, file_path: &str, key: &[u8; 32]) -> io::Result<()>
-// where
-//     S: AsyncRead + AsyncWrite + Unpin,
-// {
-//     let mut file = File::open(file_path)?;
-//     let mut buffer = vec![0u8; 4096]; // chunk 4kb
-//     let mut offset = 0;
-
-//     loop {
-//         let n = file.read(&mut buffer)?;
-//         if n == 0 {
-//             // end of file
-//             let msg = Message {
-//                 version: 1,
-//                 msg_type: MessageType::Complete,
-//             };
-//             stream.write_all(&serialize(&msg)).await?;
-//             info!("file has been sent!");
-//             break;
-//         }
-//         let chunk = &buffer[..n];
-//         let encrypted = encrypt(chunk, key).map_err(|e| {
-//             io::Error::new(io::ErrorKind::Other, format!("Failed to encrypt data: {e}"))
-//         })?;
-//         info!("chunk len: {}", chunk.len());
-//         info!("encrypted len: {}", encrypted.len());
-//         let msg = Message {
-//             version: 1,
-//             msg_type: MessageType::Chunk {
-//                 offset,
-//                 data: encrypted,
-//             },
-//         };
-
-//         stream.write_all(&serialize(&msg)).await?;
-//         offset += n as u64;
-
-//         // waiting for receive ACK message
-//         let response = read_message(stream).await?;
-//         if let MessageType::Ack { offset: ack_offset } = response.msg_type {
-//             if ack_offset != offset {
-//                 info!("Invalid ack");
-//                 return Err(io::Error::new(
-//                     io::ErrorKind::InvalidData,
-//                     "Invalid ACK offset",
-//                 ));
-//             }
-//         } else if let MessageType::Cancel = response.msg_type {
-//             info!("Transfer cancelled by peer");
-//             return Ok(());
-//         } else {
-//             return Err(io::Error::new(
-//                 io::ErrorKind::InvalidData,
-//                 "Unexpected response",
-//             ));
-//         }
-//     }
-//     Ok(())
-// }
-
-//#endregion 
 
 // send file
 async fn send_file<S>(stream: &mut S, file_path: &str, key: &[u8; 32]) -> io::Result<()>
@@ -304,98 +250,58 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut file = File::open(file_path)?;
-    let mut buffer = vec![0u8; 4096]; // raw chunk buffer
-    let mut offset = 0u64;
-
-    const MAX_ENCRYPTED_SIZE: usize = 3900;
-    const MAX_SERIALIZED_SIZE: usize = 4096;
+    let mut buffer = vec![0u8; 4096]; // chunk 4kb
+    let mut offset = 0;
 
     loop {
         let n = file.read(&mut buffer)?;
         if n == 0 {
-            // End of file
+            // end of file
             let msg = Message {
                 version: 1,
                 msg_type: MessageType::Complete,
             };
-            let serialized = serialize(&msg);
-            if serialized.len() > MAX_SERIALIZED_SIZE {
-                return Err(io::Error::new(io::ErrorKind::Other, "Complete message too large"));
-            }
-            stream.write_all(&serialized).await?;
+            stream.write_all(&serialize(&msg)).await?;
             info!("file has been sent!");
             break;
         }
-
-        let mut chunk = &buffer[..n];
-        let mut local_offset = offset;
-
-        // Encrypt and split into sub-chunks if needed
+        let chunk = &buffer[..n];
         let encrypted = encrypt(chunk, key).map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("Failed to encrypt data: {e}"))
         })?;
+        info!("chunk len: {}", chunk.len());
+        info!("encrypted len: {}", encrypted.len());
+        let msg = Message {
+            version: 1,
+            msg_type: MessageType::Chunk {
+                offset,
+                data: encrypted,
+            },
+        };
 
-        // Split encrypted data into sub-chunks so serialized message <= 4KB
-        for subchunk in encrypted.chunks(MAX_ENCRYPTED_SIZE) {
-            let msg = Message {
-                version: 1,
-                msg_type: MessageType::Chunk {
-                    offset: local_offset,
-                    data: subchunk.to_vec(),
-                },
-            };
+        stream.write_all(&serialize(&msg)).await?;
+        offset += n as u64;
 
-            let serialized = serialize(&msg);
-
-            if serialized.len() > MAX_SERIALIZED_SIZE {
+        // waiting for receive ACK message
+        let response = read_message(stream).await?;
+        if let MessageType::Ack { offset: ack_offset } = response.msg_type {
+            if ack_offset != offset {
+                info!("Invalid ack");
                 return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!(
-                        "Serialized message too large: {} bytes (max 4096)",
-                        serialized.len()
-                    ),
+                    io::ErrorKind::InvalidData,
+                    "Invalid ACK offset",
                 ));
             }
-
-            info!(
-                "Sending subchunk: offset={}, raw={}, encrypted={}, serialized={}",
-                local_offset,
-                n,
-                subchunk.len(),
-                serialized.len()
-            );
-
-            stream.write_all(&serialized).await?;
-
-            // Wait for ACK
-            let response = read_message(stream).await?;
-            match response.msg_type {
-                MessageType::Ack { offset: ack_offset } => {
-                    if ack_offset != local_offset + subchunk.len() as u64 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "Invalid ACK offset",
-                        ));
-                    }
-                }
-                MessageType::Cancel => {
-                    info!("Transfer cancelled by peer");
-                    return Ok(());
-                }
-                _ => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Unexpected response",
-                    ));
-                }
-            }
-
-            local_offset += subchunk.len() as u64;
+        } else if let MessageType::Cancel = response.msg_type {
+            info!("Transfer cancelled by peer");
+            return Ok(());
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Unexpected response",
+            ));
         }
-
-        offset += n as u64;
     }
-
     Ok(())
 }
 

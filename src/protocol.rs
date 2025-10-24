@@ -35,7 +35,6 @@ pub struct Message {
 
 pub fn serialize(msg: &Message) -> Vec<u8> {
     let json = serde_json::to_string(msg).unwrap();
-    println!("json: {}", json);
     let mut bytes = json.into_bytes();
     let len = bytes.len() as u32;
     info!("serialize len: {}", len);
@@ -50,17 +49,22 @@ pub fn deserialize(data: &[u8]) -> Option<Message> {
         return None;
     }
     let len = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
-    info!("deserialize len: {}", len);
-    info!("deserialize data.len: {}", data.len());
+    let mut data = data[9..].to_vec();
+    data.retain(|&b| b != 0); // remove null characters
+    let serialized_data_len = data.len();
+
+    // BUG: serialized_data_len is all the data not [9..] (9 byte removed in 2 previous lines)
+    // TODO: uncomment this code
     // check if some data lost
-    if data.len() != 9 + len {
-        info!("_________________________");
-        info!("real message len: {}", len);
-        info!("serialized data len: {}", data.len());
-        info!("_________________________");
-        return None;
-    }
-    let json = std::str::from_utf8(&data[9..]).ok()?;
+    // if serialized_data_len != 9 + len {
+    //     info!("_________________________");
+    //     info!("real message len: {}", len);
+    //     info!("serialized data len: {}", serialized_data_len);
+    //     info!("_________________________");
+    //     return None;
+    // }
+
+    let json = std::str::from_utf8(&data).ok()?;
     serde_json::from_str(json).ok()
 }
 

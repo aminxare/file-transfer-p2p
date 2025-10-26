@@ -15,7 +15,7 @@ pub fn encrypt(data: &[u8], key: &[u8; 32]) -> Result<Vec<u8>> {
         .map_err(|e| format!("error while filling bytes: cause -> {e}"))?;
 
     let ciphertext = cipher
-        .encrypt(&Nonce::from_slice(&nonce), data)
+        .encrypt(Nonce::from_slice(&nonce), data)
         .map_err(|e| format!("Encryption failed: {}", e))?;
 
     let mut encrypted = nonce.to_vec();

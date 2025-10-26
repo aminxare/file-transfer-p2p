@@ -36,7 +36,7 @@ pub fn serialize(msg: &Message) -> Vec<u8> {
     let json = serde_json::to_string(msg).unwrap();
     let mut bytes = json.into_bytes();
     let len = bytes.len() as u32;
-    
+
     let mut header = b"MAGIC".to_vec(); // 5 bytes magic
     header.extend_from_slice(&len.to_be_bytes()); // 4 bytes length
     header.append(&mut bytes);
@@ -50,7 +50,7 @@ pub fn deserialize(data: &[u8]) -> Option<Message> {
     let len = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
     let mut data = data[9..].to_vec();
     data.retain(|&b| b != 0); // remove null characters
-    
+
     // check if some data lost
     if data.len() != len {
         return None;

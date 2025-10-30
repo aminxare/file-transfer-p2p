@@ -4,8 +4,9 @@ use crate::network::io::read_message;
 use crate::protocol::{Message, MessageType, serialize};
 use crate::security::encrypt;
 use log::info;
-use std::fs::File;
-use std::io::{self, Read};
+use tokio::fs::File;
+use std::io;
+use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 /// Sends a file through the given stream, encrypted with the provided key.
@@ -13,12 +14,12 @@ pub async fn send_file<S>(stream: &mut S, file_path: &str, key: &[u8; 32]) -> io
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut file = File::open(file_path)?;
-    let mut buffer = vec![0u8; 4096];
+    let mut file = File::open(file_path).await?;
+    let mut buffer = vec![0u8; 262_144];
     let mut offset = 0;
 
     loop {
-        let n = file.read(&mut buffer)?;
+        let n = file.read(&mut buffer).await?;
         if n == 0 {
             stream
                 .write_all(&serialize(&Message {

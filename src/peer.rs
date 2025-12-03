@@ -5,6 +5,7 @@ use crate::protocol::{Message, MessageType, serialize};
 use log::{error, info, warn};
 use rand_core::OsRng;
 use std::fs::File;
+use std::path::{self, Path};
 use tokio::{
     io::{self, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -77,16 +78,19 @@ async fn send_file_request_and_transfer(
     file_path: &str,
     key: &[u8; 32],
 ) -> io::Result<()> {
-    let file = File::open(file_path)?;
+    let path = Path::new(file_path);
+    let file = File::open(path)?;
     let metadata = file.metadata()?;
     let hash = "dummy_hash".to_string(); // TODO: Replace with SHA-256
+
+    let file_name = path.file_name().unwrap().to_str().unwrap().into();
 
     // Send REQUEST
     info!("Sending file request...");
     let msg = Message {
         version: 1,
         msg_type: MessageType::Request {
-            file_name: file_path.to_string(),
+            file_name,
             size: metadata.len(),
             hash,
         },

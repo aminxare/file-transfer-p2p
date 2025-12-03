@@ -2,11 +2,10 @@ use clap::Parser;
 use log::{error, info};
 use tokio::{fs::File, io, spawn};
 
-use crate::peer::{connect_to_peer, start_listener};
+use crate::network::{client::connect_to_peer, listenter::start_listener};
 
 mod file_transfer;
 mod network;
-mod peer;
 mod protocol;
 mod security;
 mod tls;

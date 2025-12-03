@@ -4,6 +4,10 @@ name = "file-transfer-p2p"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "ft"
+path = "./src/lib.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 rustls = "0.23"

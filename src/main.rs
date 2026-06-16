@@ -2,13 +2,7 @@ use clap::Parser;
 use log::{error, info};
 use tokio::{fs::File, io, spawn};
 
-use crate::network::{client::connect_to_peer, listenter::start_listener};
-
-mod file_transfer;
-mod network;
-mod protocol;
-mod security;
-mod tls;
+use ft::network::{client::connect_to_peer, listener::start_listener};
 
 #[derive(Parser)]
 #[command(
@@ -17,54 +11,54 @@ mod tls;
     long_about = "A peer-to-peer file transfer tool with TLS and encryption.\n\
                    Usage examples:\n\
                    - Start listener: cargo run -- --port 8081\n\
-                   - Send file: cargo run -- --send test.txt --to 127.0.0.1:8081"
+                   - Send file: cargo run -- --file test.txt --to 127.0.0.1:8081"
 )]
 struct Args {
     #[arg(short, long, help = "Port to listen on")]
     port: Option<u16>,
-    #[arg(short, long, help = "Path to file to send")]
-    send: Option<String>,
     #[arg(
         short,
         long,
         help = "Address of peer to send file to (e.g., 127.0.0.1:8081)"
     )]
-    to: Option<String>,
+    address: Option<String>,
+    #[arg(short, long, help = "Path to file to send")]
+    file: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    // initilize loggig
     simple_logger::init().unwrap();
-
     let args = Args::parse();
 
     // send file
-    if let (Some(p), Some(to)) = (args.send, args.to) {
-        info!("Sending file: {} to: {}", p, to);
-        send_file(p.as_str(), to.as_str()).await?;
+    if let (Some(file_path), Some(address)) = (args.file, args.address) {
+        info!("Sending file: {} to: {}", file_path, address);
+        send_file(file_path.as_str(), address.as_str()).await?;
     }
 
     // start listener
     if let Some(port) = args.port {
-        let handler = spawn(async move {
-            info!("server started lintening on port: {}", port);
+        let _handler = spawn(async move {
+            info!("server started listening on port: {}", port);
 
             if let Err(e) = start_listener(port).await {
                 error!("Listener error: {e}");
             }
         });
-        handler.await?;
+        // We don't necessarily want to wait for the handler if we are also sending a file in the same process,
+        // but typically it's one or the other. If it's a listener, it should run forever.
+        // For simplicity in CLI, we wait if port is provided.
+        tokio::signal::ctrl_c().await?;
+        info!("Shutting down...");
     }
 
     Ok(())
 }
 
 async fn send_file(path: &str, addr: &str) -> io::Result<()> {
-    // check if file is not exist then panic
-    let file = File::open(path).await?;
-    drop(file);
-
+    // check if file exists
+    let _file = File::open(path).await?;
     connect_to_peer(addr, path).await?;
     Ok(())
 }

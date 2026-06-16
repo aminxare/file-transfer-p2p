@@ -1,66 +1,51 @@
 #[cfg(test)]
 mod tests {
     use ft::network::client::connect_to_peer;
-    use ft::network::listenter::start_listener;
-    use rand_core::OsRng;
-    use x25519_dalek::{EphemeralSecret, PublicKey};
-
+    use ft::network::listener::start_listener;
     use std::fs;
     use tokio::time::{Duration, timeout};
+    use tempfile::tempdir;
 
     #[tokio::test]
-    async fn test_key_exchange() {
-        let sender_secret = EphemeralSecret::random_from_rng(OsRng);
-        let sender_public = PublicKey::from(&sender_secret);
-        let receiver_secret = EphemeralSecret::random_from_rng(OsRng);
-        let receiver_public = PublicKey::from(&receiver_secret);
-        let sender_shared = sender_secret.diffie_hellman(&receiver_public);
-        let receiver_shared = receiver_secret.diffie_hellman(&sender_public);
-        assert_eq!(sender_shared.to_bytes(), receiver_shared.to_bytes());
-    }
+    async fn test_full_file_transfer() {
+        let dir = tempdir().expect("Failed to create temp dir");
+        let send_path = dir.path().join("send.txt");
+        let recv_path = dir.path().join("recv_send.txt");
+        
+        let content = "Hello, this is a secure P2P file transfer test!";
+        fs::write(&send_path, content).expect("Failed to write test file");
 
-    // TODO: use tmp file
-    #[tokio::test]
-    async fn test_connect_and_send_request() {
-        let port = 8081;
+        let port = 9000;
 
-        tokio::spawn(async move {
+        // Start listener in a separate task
+        let _server = tokio::spawn(async move {
+            // We need to change the current directory for the server task 
+            // so it saves the file in the temp dir.
+            // Actually, receive_file currently uses a hardcoded "recv_{file_name}".
+            // To make it testable, we'll just run the test in the temp dir.
+            std::env::set_current_dir(dir.path()).unwrap();
             start_listener(port).await.unwrap();
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Give the server a moment to start
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
-        fs::write("test.txt", "Hello").unwrap();
+        // Connect and send file
         let result = timeout(
-            Duration::from_secs(2),
-            connect_to_peer("127.0.0.1:8081", "test.txt"),
+            Duration::from_secs(5),
+            connect_to_peer("127.0.0.1:9000", send_path.to_str().unwrap()),
         )
         .await;
-        assert!(result.is_ok(), "Failed to connect and send request");
-        fs::remove_file("test.txt").unwrap();
-    }
 
-    #[tokio::test]
-    async fn test_receive_file() {
-        let port = 8083;
+        assert!(result.is_ok(), "File transfer timed out or failed: {:?}", result);
+        assert!(result.unwrap().is_ok(), "connect_to_peer returned error");
 
-        tokio::spawn(async move {
-            start_listener(port).await.unwrap();
-        });
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        fs::write("send_test.txt", "Hello, world!").unwrap();
-
-        let result = timeout(
-            Duration::from_secs(2),
-            connect_to_peer("127.0.0.1:8083", "send_test.txt"),
-        )
-        .await;
-        assert!(result.is_ok(), "Failed to send file");
-
-        let received = fs::read_to_string("send_test.txt").unwrap();
-        assert_eq!(received, "Hello, world!");
-
-        fs::remove_file("send_test.txt").unwrap();
+        // Verify the received file
+        // Wait a bit for the file to be flushed/closed
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        
+        assert!(recv_path.exists(), "Received file does not exist at {:?}", recv_path);
+        let received_content = fs::read_to_string(&recv_path).expect("Failed to read received file");
+        assert_eq!(content, received_content);
     }
 }

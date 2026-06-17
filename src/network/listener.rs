@@ -73,7 +73,7 @@ async fn handle_connection(
                 let response = Message::new(MessageType::Accept);
 
                 stream.write_all(&serialize(&response)).await?;
-                return receive_file(&mut stream, &file_name, &key).await;
+                return receive_file(&mut stream, &file_name, size, &key).await;
             }
             MessageType::Cancel => {
                 info!("Transfer cancelled by {}", addr);

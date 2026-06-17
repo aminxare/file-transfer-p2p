@@ -21,12 +21,21 @@ where
 {
     // Read fixed header: 5 bytes magic + 4 bytes length (big-endian)
     let mut header = [0u8; HEADER_SIZE];
-    stream.read_exact(&mut header).await?;
+    if let Err(e) = stream.read_exact(&mut header).await {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "Peer closed the connection before sending header",
+            ));
+        }
+        return Err(e);
+    }
 
     if &header[0..5] != MAGIC {
+        let actual = String::from_utf8_lossy(&header[0..5]);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "Invalid magic header",
+            format!("Invalid magic header: expected 'MAGIC', got '{}' (bytes: {:?})", actual, &header[0..5]),
         ));
     }
 
